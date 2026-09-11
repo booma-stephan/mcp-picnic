@@ -41,6 +41,7 @@ build/Release
 # Dependency directories
 node_modules/
 jspm_packages/
+.worktrees/
 
 # Snowpack dependency directory (https://snowpack.dev/)
 web_modules/
@@ -302,3 +303,7 @@ cython_debug/
 Cntfl-Readme.md
 
 **/.claude/settings.local.json
+
+# Picnic session file
+picnic-session.json
+

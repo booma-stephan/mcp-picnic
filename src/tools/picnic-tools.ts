@@ -1,6 +1,23 @@
 import { z } from "zod"
-import { toolRegistry } from "./registry.js"
-import { getPicnicClient, initializePicnicClient } from "../utils/picnic-client.js"
+import { toolRegistry, mcpContent } from "./registry.js"
+import {
+  getPicnicClient,
+  initializePicnicClient,
+  saveSession,
+  verifyPicnic2FACode,
+} from "../utils/picnic-client.js"
+import {
+  resolveRecipeId,
+  parseSellingGroupRecipe,
+  parseRecipeList,
+  buildRecipeSourceUrl,
+} from "../utils/recipe-parser.js"
+import {
+  buildShoppingList,
+  findMealCombinations,
+  parseRecipeIngredients,
+} from "../utils/recipe-meal-planning.js"
+import { config } from "../config.js"
 
 /**
  * Picnic API tools optimized for LLM consumption
@@ -16,47 +33,85 @@ import { getPicnicClient, initializePicnicClient } from "../utils/picnic-client.
 async function ensureClientInitialized() {
   try {
     getPicnicClient()
-  } catch (error) {
+  } catch {
     // Client not initialized, initialize it now
     await initializePicnicClient()
   }
 }
+
+/**
+ * Runs a cart mutation, converting failures into an explicitly ambiguous error.
+ *
+ * Picnic applies the mutation and renders the updated cart in the same request, so a
+ * non-2xx response does not mean the write was rejected — it may already have landed and
+ * only the render failed. A caller that reads such an error as "nothing happened" will
+ * retry, and each retry applies the change again. Say so instead of reporting a clean
+ * failure, and point the caller at a read rather than a retry.
+ */
+async function mutateCart<T>(action: string, mutation: () => Promise<T>): Promise<T> {
+  try {
+    return await mutation()
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    throw new Error(
+      `${action} failed: ${message}. The cart may still have been modified — ` +
+        `call picnic_get_cart to check the current contents before retrying, ` +
+        `because retrying can apply the change a second time.`,
+    )
+  }
+}
+
+// Annotations shared by every tool that mutates cart contents. Tells the calling model the
+// operation is not safe to blindly retry (see mutateCart above).
+const CART_MUTATION_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+} as const
 
 // Helper function to filter cart data for LLM consumption
 function filterCartData(cart: unknown) {
   if (!cart || typeof cart !== "object") return cart
 
   const cartObj = cart as {
-    items?: unknown[]
+    type?: string
+    id?: string
+    items?: Array<{
+      id?: string
+      display_price?: number
+      price?: number
+      items?: Array<{
+        id?: string
+        name?: string
+        unit_quantity?: string
+        price?: number
+        image_ids?: string[]
+        max_count?: number
+        decorators?: Array<{ type?: string; quantity?: number }>
+      }>
+    }>
     total_count?: number
     total_price?: number
     checkout_total_price?: number
     total_savings?: number
-    delivery_slots?: unknown[]
-    selected_slot?: unknown
-    [key: string]: unknown
   }
 
-  // Filter items to essential info only
-  const filteredItems = cartObj.items?.map((item: unknown) => {
-    const itemObj = item as {
-      id?: string
-      name?: string
-      display_price?: number
-      unit_quantity?: string
-      count?: number
-      price?: number
-      [key: string]: unknown
-    }
-
-    return {
-      id: itemObj.id,
-      name: itemObj.name,
-      price: itemObj.display_price || itemObj.price,
-      unit: itemObj.unit_quantity,
-      quantity: itemObj.count,
-    }
-  })
+  const filteredItems = cartObj.items?.map((orderLine) => ({
+    order_line_id: orderLine.id,
+    price: orderLine.display_price || orderLine.price,
+    articles: orderLine.items?.map((article) => ({
+      product_id: article.id,
+      name: article.name,
+      unit: article.unit_quantity,
+      price: article.price,
+      // How many of this article are in the cart. Picnic carries it in a QUANTITY decorator
+      // rather than a plain field; without it a caller cannot tell one unit from three, so it
+      // cannot check whether an ambiguous add actually landed (see mutateCart).
+      quantity: article.decorators?.find((d) => d.type === "QUANTITY")?.quantity ?? 1,
+      ...(article.image_ids?.length && { image_id: article.image_ids[0] }),
+    })),
+  }))
 
   return {
     type: cartObj.type,
@@ -67,6 +122,106 @@ function filterCartData(cart: unknown) {
     checkout_total_price: cartObj.checkout_total_price,
     total_savings: cartObj.total_savings,
   }
+}
+
+type UnknownRecord = Record<string, unknown>
+
+interface PicnicPromotionProduct {
+  product_id: string
+  promotion_id: string
+  name: string
+  price: number
+  unit?: string
+  promotion_label?: string
+  original_price?: number
+  image_id?: string
+  max_count?: number
+}
+
+function isRecord(value: unknown): value is UnknownRecord {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value))
+}
+
+function getRecordProperty(record: UnknownRecord, key: string): UnknownRecord | null {
+  const value = record[key]
+  return isRecord(value) ? value : null
+}
+
+function getPromotionContext(tile: UnknownRecord): UnknownRecord | null {
+  const analytics = getRecordProperty(tile, "analytics")
+  const contexts = analytics?.contexts
+  if (!Array.isArray(contexts)) return null
+
+  for (const context of contexts) {
+    if (!isRecord(context)) continue
+    const data = getRecordProperty(context, "data")
+    if (typeof data?.promotion_id === "string") return data
+  }
+
+  return null
+}
+
+function toPromotionProduct(tile: UnknownRecord): PicnicPromotionProduct | null {
+  const content = getRecordProperty(tile, "content")
+  const sellingUnit = content ? getRecordProperty(content, "sellingUnit") : null
+  const promotion = getPromotionContext(tile)
+
+  if (!sellingUnit || !promotion) return null
+  if (typeof sellingUnit.id !== "string" || typeof sellingUnit.name !== "string") return null
+  if (typeof promotion.promotion_id !== "string") return null
+
+  const price =
+    typeof promotion.price === "number"
+      ? promotion.price
+      : typeof sellingUnit.display_price === "number"
+        ? sellingUnit.display_price
+        : null
+  if (price === null) return null
+
+  return {
+    product_id: sellingUnit.id,
+    promotion_id: promotion.promotion_id,
+    name: sellingUnit.name,
+    price,
+    ...(typeof sellingUnit.unit_quantity === "string" && { unit: sellingUnit.unit_quantity }),
+    ...(typeof promotion.promotion_label === "string" && {
+      promotion_label: promotion.promotion_label,
+    }),
+    ...(typeof promotion.strikethrough_price === "number" &&
+      promotion.show_strikethrough_price !== false && {
+        original_price: promotion.strikethrough_price,
+      }),
+    ...(typeof sellingUnit.image_id === "string" && { image_id: sellingUnit.image_id }),
+    ...(typeof sellingUnit.max_count === "number" && { max_count: sellingUnit.max_count }),
+  }
+}
+
+function extractPromotionsFromPage(page: unknown): PicnicPromotionProduct[] {
+  const promotions: PicnicPromotionProduct[] = []
+  const seen = new Set<string>()
+
+  const visit = (node: unknown): void => {
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child)
+      return
+    }
+
+    if (!isRecord(node)) return
+
+    const promotion = toPromotionProduct(node)
+    if (promotion) {
+      const key = `${promotion.product_id}:${promotion.promotion_id}`
+      if (!seen.has(key)) {
+        seen.add(key)
+        promotions.push(promotion)
+      }
+    }
+
+    for (const value of Object.values(node)) visit(value)
+  }
+
+  visit(page)
+  return promotions
 }
 
 // Search products tool
@@ -92,7 +247,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const allResults = await client.search(args.query)
+    const allResults = await client.catalog.search(args.query)
 
     // Apply pagination
     const startIndex = args.offset || 0
@@ -123,6 +278,60 @@ toolRegistry.register({
   },
 })
 
+// Weekly promotions/deals tool
+const promotionsInputSchema = z.object({
+  limit: z
+    .number()
+    .min(1)
+    .max(100)
+    .default(25)
+    .describe("Maximum number of promotions to return (1-100, default: 25)"),
+  offset: z
+    .number()
+    .min(0)
+    .default(0)
+    .describe("Number of promotions to skip for pagination (default: 0)"),
+})
+
+toolRegistry.register({
+  name: "picnic_get_promotions",
+  description:
+    "Get Picnic's current weekly promotions/deals from the app's 'Alle acties' page. " +
+    "Returns promoted products with current price, promotion label, original price when shown, " +
+    "and pagination.",
+  inputSchema: promotionsInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const page = await client.sendRequest(
+      "GET",
+      "/pages/promo-page-all-promos-redirect",
+      null,
+      true,
+    )
+    const allPromotions = extractPromotionsFromPage(page)
+
+    const startIndex = args.offset ?? 0
+    const limit = args.limit ?? 25
+    const promotions = allPromotions.slice(startIndex, startIndex + limit)
+
+    return {
+      source: {
+        pageId: "promo-page-all-promos-redirect",
+        endpoint: "/pages/promo-page-all-promos-redirect",
+      },
+      promotions,
+      pagination: {
+        offset: startIndex,
+        limit,
+        returned: promotions.length,
+        total: allPromotions.length,
+        hasMore: startIndex + limit < allPromotions.length,
+      },
+    }
+  },
+})
+
 // Get product suggestions tool
 const suggestionsInputSchema = z.object({
   query: z.string().describe("Query for product suggestions"),
@@ -135,7 +344,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const suggestions = await client.getSuggestions(args.query)
+    const suggestions = await client.catalog.getSuggestions(args.query)
     return {
       query: args.query,
       suggestions,
@@ -145,6 +354,47 @@ toolRegistry.register({
 
 // Note: picnic_get_article tool removed - endpoint deprecated (GitHub issue #23)
 // Use picnic_search instead for basic product information
+
+// Get product details tool
+const productDetailsInputSchema = z.object({
+  productId: z
+    .string()
+    .describe("The product selling unit ID (e.g. 's1001524'), as returned by search or cart"),
+  full: z
+    .boolean()
+    .default(false)
+    .describe(
+      "When false (default), returns essential fields only (id, name, brand, price, unit, image). " +
+        "When true, returns full details including description, allergens, nutritional info, promotions, and similar products.",
+    ),
+})
+
+toolRegistry.register({
+  name: "picnic_get_product_details",
+  description:
+    "Look up product details by ID. Returns essential info by default (name, brand, price, unit, image). " +
+    "Set full=true for complete details including description, allergens, ingredients, and similar products. " +
+    "Use this to resolve opaque product IDs from cart or order history.",
+  inputSchema: productDetailsInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const details = await client.catalog.getProductDetails(args.productId)
+
+    if (args.full) {
+      return details
+    }
+
+    return {
+      id: details.id,
+      name: details.name,
+      brand: details.brand,
+      price: details.displayPrice,
+      unit: details.unitQuantity,
+      ...(details.imageIds.length > 0 && { image_id: details.imageIds[0] }),
+    }
+  },
+})
 
 // Get product image tool
 const imageInputSchema = z.object({
@@ -156,230 +406,451 @@ const imageInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_get_image",
-  description: "Get image data for a product using the image ID and size",
+  description:
+    "Get a product image by image ID and size. Returns the image itself as MCP image content.",
   inputSchema: imageInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const image = await client.getImage(args.imageId, args.size)
+    const image = await client.catalog.getImage(args.imageId, args.size)
+    // Picnic serves these as PNG (/static/images/<id>/<size>.png).
+    return mcpContent([
+      {
+        type: "image",
+        data: Buffer.from(image).toString("base64"),
+        mimeType: "image/png",
+      },
+    ])
+  },
+})
+
+// Recipe tools
+//
+// Picnic recipes are "selling groups". Recipe detail comes from
+// /pages/selling-group-details-page?selling_group_id=<id>, and the cookbook /
+// recipe overview from /pages/cookbook-page-content. These page routes are
+// called directly via sendRequest because the picnic-api recipe.* page methods
+// target outdated ids (recipe-details-page-root) that the API answers with 404.
+
+// Base URL for recipe/product image derivatives, derived from the API URL, e.g.
+// https://storefront-prod.de.picnicinternational.com/static/images
+function recipeImageBaseUrl(client: ReturnType<typeof getPicnicClient>): string {
+  return client.url.replace(/\/api\/.*$/, "/static/images")
+}
+
+const RECIPE_CATEGORY_INPUT_RE = /^(?:recipe[_-]cattree[_-])?[a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?$/i
+const RECIPE_CATEGORY_PAGE_ID_RE = /recipe[_-]cattree[_-][a-z0-9]+(?:[a-z0-9_-]*[a-z0-9])?/gi
+const RECIPE_CATEGORY_PREFIX_RE = /^recipe[_-]cattree[_-]/i
+
+async function fetchRecipePage(client: ReturnType<typeof getPicnicClient>, pageId: string) {
+  const page = await client.sendRequest("GET", `/pages/${pageId}`, null, true)
+  return { pageId, page }
+}
+
+async function fetchRecipeListPage(client: ReturnType<typeof getPicnicClient>, category?: string) {
+  if (!category) return fetchRecipePage(client, "cookbook-page-content")
+
+  if (RECIPE_CATEGORY_PREFIX_RE.test(category)) {
+    return fetchRecipePage(client, category)
+  }
+
+  const underscorePageId = `recipe_cattree_${category}`
+  try {
+    return await fetchRecipePage(client, underscorePageId)
+  } catch (error) {
+    const dashPageId = `recipe-cattree-${category}`
+    try {
+      return await fetchRecipePage(client, dashPageId)
+    } catch {
+      throw error
+    }
+  }
+}
+
+function extractRecipeCategoryIds(page: unknown): string[] {
+  const ids = new Set<string>()
+
+  const visit = (node: unknown): void => {
+    if (typeof node === "string") {
+      for (const match of node.matchAll(RECIPE_CATEGORY_PAGE_ID_RE)) ids.add(match[0])
+      return
+    }
+    if (Array.isArray(node)) {
+      for (const child of node) visit(child)
+      return
+    }
+    if (!node || typeof node !== "object") return
+    for (const value of Object.values(node as Record<string, unknown>)) visit(value)
+  }
+
+  visit(page)
+  return [...ids]
+}
+
+async function fetchCookbookRecipes(client: ReturnType<typeof getPicnicClient>) {
+  const { page } = await fetchRecipeListPage(client)
+  return parseRecipeList(page, { imageBaseUrl: recipeImageBaseUrl(client) })
+}
+
+function paginateRecipes(all: ReturnType<typeof parseRecipeList>, offset: number, limit: number) {
+  const startIndex = offset || 0
+  const recipes = all.slice(startIndex, startIndex + limit).map((recipe) => ({
+    ...recipe,
+    sourceUrl: buildRecipeSourceUrl(config.PICNIC_COUNTRY_CODE, recipe.recipeId),
+  }))
+  return {
+    recipes,
+    pagination: {
+      offset: startIndex,
+      limit,
+      returned: recipes.length,
+      total: all.length,
+      hasMore: startIndex + limit < all.length,
+    },
+  }
+}
+
+// Get recipe tool
+const getRecipeInputSchema = z.object({
+  recipe_url_or_id: z
+    .string()
+    .min(1)
+    .describe(
+      "A Picnic recipe URL (any format) or a 24-character hex recipe ID. " +
+        "Examples: 'https://picnic.app/de/go/abc123', " +
+        "'https://picnic.app/de/rezepte/0123456789abcdef01234567/example-recipe', " +
+        "'0123456789abcdef01234567'",
+    ),
+})
+
+toolRegistry.register({
+  name: "picnic_get_recipe",
+  description:
+    "Fetch a Picnic recipe by URL or recipe ID. Returns structured recipe data: name, " +
+    "description, ingredients, preparation steps, timing, servings, image URL, saved state, " +
+    "and the canonical source URL. Accepts short share links (picnic.app/de/go/xxx), full " +
+    "recipe URLs, or bare recipe IDs.",
+  inputSchema: getRecipeInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    const page = await client.sendRequest(
+      "GET",
+      `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(recipeId)}`,
+      null,
+      true,
+    )
+    const parsed = parseSellingGroupRecipe(page, { imageBaseUrl: recipeImageBaseUrl(client) })
+    const sourceUrl = buildRecipeSourceUrl(config.PICNIC_COUNTRY_CODE, recipeId)
+    return { recipeId, sourceUrl, ...parsed }
+  },
+})
+
+// Browse / saved recipes
+const recipeListInputSchema = z.object({
+  category: z
+    .string()
+    .regex(
+      RECIPE_CATEGORY_INPUT_RE,
+      "Use a bare recipe category ID or a full recipe_cattree/recipe-cattree page ID.",
+    )
+    .optional()
+    .describe(
+      "Recipe category ID, such as '20minuten', or full page ID, such as 'recipe-cattree-jamie-oliver'.",
+    ),
+  limit: z
+    .number()
+    .min(1)
+    .max(100)
+    .default(25)
+    .describe("Maximum number of recipes to return (1-100, default: 25)"),
+  offset: z
+    .number()
+    .min(0)
+    .default(0)
+    .describe("Number of recipes to skip for pagination (default: 0)"),
+})
+
+toolRegistry.register({
+  name: "picnic_browse_recipes",
+  description:
+    "Browse Picnic's recipe/cookbook overview or a specific recipe category. Returns a " +
+    "paginated list of recipes (id, name, image URL, cookbook section, source URL) and " +
+    "category page IDs when available. Use the recipeId with picnic_get_recipe for full details.",
+  inputSchema: recipeListInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const { pageId, page } = await fetchRecipeListPage(client, args.category)
+    const all = parseRecipeList(page, { imageBaseUrl: recipeImageBaseUrl(client) })
+    const result = { pageId, ...paginateRecipes(all, args.offset ?? 0, args.limit ?? 25) }
+    const categories = extractRecipeCategoryIds(page)
+    if ((!args.category || all.length === 0) && categories.length > 0) {
+      return { ...result, categories }
+    }
+    return result
+  },
+})
+
+toolRegistry.register({
+  name: "picnic_get_saved_recipes",
+  description:
+    "List the recipes the user has saved/favourited in their Picnic cookbook (the " +
+    "'Gespeichert' tab), distinct from the public discovery feed. Returns id, name, image URL " +
+    "and source URL — useful for importing saved recipes elsewhere.",
+  inputSchema: recipeListInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const all = await fetchCookbookRecipes(client)
+    const saved = all.filter((recipe) => recipe.segments.includes("SAVED_RECIPES"))
+    return paginateRecipes(saved, args.offset ?? 0, args.limit ?? 25)
+  },
+})
+
+toolRegistry.register({
+  name: "picnic_get_own_recipes",
+  description:
+    "List the user's own recipes (the cookbook 'Eigene Rezepte' tab — user-created recipes). " +
+    "Returns id, name, image URL and source URL.",
+  inputSchema: recipeListInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const all = await fetchCookbookRecipes(client)
+    const own = all.filter((recipe) => recipe.segments.includes("USER_DEFINED_RECIPES"))
+    return paginateRecipes(own, args.offset ?? 0, args.limit ?? 25)
+  },
+})
+
+// Save / unsave recipe
+const recipeRefInputSchema = z.object({
+  recipe_url_or_id: z
+    .string()
+    .min(1)
+    .describe("A Picnic recipe URL (any format) or a 24-character hex recipe ID."),
+})
+
+toolRegistry.register({
+  name: "picnic_save_recipe",
+  description: "Save a recipe to the user's Picnic cookbook, by URL or recipe ID.",
+  inputSchema: recipeRefInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    await client.sendRequest(
+      "POST",
+      "/pages/task/recipe-saving",
+      { payload: { recipe_id: recipeId, saved_at: new Date().toISOString() } },
+      true,
+    )
+    return { message: "Recipe saved", recipeId }
+  },
+})
+
+toolRegistry.register({
+  name: "picnic_unsave_recipe",
+  description: "Remove a recipe from the user's Picnic cookbook, by URL or recipe ID.",
+  inputSchema: recipeRefInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    await client.sendRequest(
+      "POST",
+      "/pages/task/recipe-saving",
+      { payload: { recipe_id: recipeId, saved_at: null } },
+      true,
+    )
+    return { message: "Recipe removed from cookbook", recipeId }
+  },
+})
+
+// Add a recipe's ingredients to the basket by assigning the selling group.
+const addRecipeToCartInputSchema = z.object({
+  recipe_url_or_id: z
+    .string()
+    .min(1)
+    .describe("A Picnic recipe URL (any format) or a 24-character hex recipe ID."),
+  portions: z
+    .number()
+    .min(1)
+    .optional()
+    .describe("Number of portions to add (defaults to the recipe's default portions)."),
+})
+
+toolRegistry.register({
+  name: "picnic_add_recipe_to_cart",
+  description:
+    "Add a recipe's ingredients to the shopping cart by assigning the recipe (selling group) " +
+    "to the basket. Optionally set the number of portions. If this fails, call picnic_get_cart " +
+    "to check whether the ingredients landed before retrying.",
+  inputSchema: addRecipeToCartInputSchema,
+  annotations: CART_MUTATION_ANNOTATIONS,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    const payload: { selling_group_id: string; portions?: number } = { selling_group_id: recipeId }
+    if (args.portions !== undefined) payload.portions = args.portions
+    await mutateCart("Adding the recipe to the cart", () =>
+      client.sendRequest("POST", "/pages/task/assign-selling-group-to-basket", { payload }, true),
+    )
     return {
-      imageId: args.imageId,
-      size: args.size,
-      image,
+      message: "Recipe added to cart",
+      recipeId,
+      ...(args.portions !== undefined && { portions: args.portions }),
     }
   },
 })
 
-// Get categories tool
+// Remove a recipe's ingredients from the basket (inverse of add_recipe_to_cart).
 toolRegistry.register({
-  name: "picnic_get_categories",
-  description: "Get product categories with flexible filtering for different use cases",
+  name: "picnic_remove_recipe_from_cart",
+  description:
+    "Remove a recipe (selling group) from the basket, undoing picnic_add_recipe_to_cart. " +
+    "Removes only that recipe's ingredients, leaving the rest of the cart untouched.",
+  inputSchema: recipeRefInputSchema,
+  annotations: CART_MUTATION_ANNOTATIONS,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    const client = getPicnicClient()
+    const recipeId = await resolveRecipeId(args.recipe_url_or_id)
+    await mutateCart("Removing the recipe from the cart", () =>
+      client.sendRequest(
+        "POST",
+        "/pages/task/remove-selling-group-from-basket",
+        { payload: { selling_group_id: recipeId } },
+        true,
+      ),
+    )
+    return { message: "Recipe removed from cart", recipeId }
+  },
+})
+
+// Recipe meal-planning tools
+const recipeIngredientsInputSchema = z.object({
+  recipe_url_or_id: z
+    .string()
+    .min(1)
+    .describe("A Picnic recipe URL (any format) or a 24- or 32-character hex recipe ID."),
+})
+
+async function fetchRecipeIngredientsByRef(
+  client: ReturnType<typeof getPicnicClient>,
+  recipeUrlOrId: string,
+) {
+  const recipeId = await resolveRecipeId(recipeUrlOrId)
+  const page = await client.sendRequest(
+    "GET",
+    `/pages/selling-group-details-page?selling_group_id=${encodeURIComponent(recipeId)}`,
+    null,
+    true,
+  )
+  const parsed = parseRecipeIngredients(page)
+  if (!parsed) throw new Error(`Could not find recipe ingredient data for ${recipeId}`)
+  return parsed
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+toolRegistry.register({
+  name: "picnic_get_recipe_ingredients",
+  description:
+    "Fetch structured Picnic recipe ingredients by recipe URL or ID. Returns selling-unit IDs, " +
+    "quantities, pantry flags, package display text, and prices for meal planning.",
+  inputSchema: recipeIngredientsInputSchema,
+  handler: async (args) => {
+    await ensureClientInitialized()
+    return fetchRecipeIngredientsByRef(getPicnicClient(), args.recipe_url_or_id)
+  },
+})
+
+toolRegistry.register({
+  name: "picnic_get_multiple_recipe_ingredients",
+  description:
+    "Fetch structured ingredient lists for multiple Picnic recipes. Returns successful recipes " +
+    "and per-input errors so one unavailable recipe does not discard the whole batch.",
   inputSchema: z.object({
-    depth: z
-      .number()
-      .min(0)
-      .max(3)
-      .default(0)
-      .describe("Category depth (0=top level, 1=with subcategories)"),
-    limit: z.number().min(1).max(20).default(8).describe("Maximum categories to return"),
-    includeImages: z.boolean().default(false).describe("Include image IDs"),
-    useCase: z
-      .enum(["browse", "search", "detailed"])
-      .default("browse")
-      .describe("Optimize for use case"),
+    recipe_urls_or_ids: z
+      .array(z.string().min(1))
+      .min(1)
+      .max(20)
+      .describe("Picnic recipe URLs or 24-/32-character recipe IDs, up to 20."),
   }),
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const categories = await client.getCategories(args.depth)
-
-    const catalogArray = (categories as any).catalog || []
-
-    // Adjust filtering based on use case
-    const getFieldsForUseCase = (useCase: string) => {
-      switch (useCase) {
-        case "search":
-          return ["id", "name", "type"] // Minimal for search filtering
-        case "detailed":
-          return ["id", "name", "type", "level", "items_count", "items"] // More context
-        default: // browse
-          return ["id", "name", "type", "items_count"] // Good balance
-      }
-    }
-
-    const relevantFields = getFieldsForUseCase(args.useCase || "browse")
-
-    const limitedCatalog = catalogArray.slice(0, args.limit || 8).map((category: any) => {
-      const filtered: any = {}
-
-      relevantFields.forEach((field) => {
-        if (field === "items_count") {
-          filtered.items_count = category.items ? category.items.length : 0
-        } else if (field === "items" && category.items && (args.depth || 0) > 0) {
-          filtered.items = category.items.slice(0, 3).map((item: any) => ({
-            id: item.id,
-            name: item.name,
-            type: item.type,
-          }))
-        } else if (category[field] !== undefined) {
-          filtered[field] = category[field]
-        }
-      })
-
-      if (args.includeImages && category.image_id) {
-        filtered.image_id = category.image_id
-      }
-
-      return filtered
-    })
+    const results = await Promise.allSettled(
+      args.recipe_urls_or_ids.map((input) => fetchRecipeIngredientsByRef(client, input)),
+    )
 
     return {
-      type: categories.type,
-      catalog: limitedCatalog,
-      meta: {
-        total_categories: catalogArray.length,
-        returned: limitedCatalog.length,
-        use_case: args.useCase,
-        truncated: catalogArray.length > (args.limit || 8),
-        next_page_hint:
-          catalogArray.length > (args.limit || 8)
-            ? `Use limit=${(args.limit || 8) * 2} to see more categories`
-            : null,
-      },
+      recipes: results.flatMap((result) => (result.status === "fulfilled" ? [result.value] : [])),
+      errors: results.flatMap((result, index) =>
+        result.status === "rejected"
+          ? [{ input: args.recipe_urls_or_ids[index], error: getErrorMessage(result.reason) }]
+          : [],
+      ),
     }
   },
 })
 
-// Get category details tool
-const categoryDetailsInputSchema = z.object({
-  categoryId: z.string().describe("The ID of the category to get details for"),
-  includeItems: z.boolean().default(true).describe("Include items/subcategories in this category"),
-  itemsLimit: z.number().min(1).max(50).default(20).describe("Maximum items to return"),
-  includeImages: z.boolean().default(false).describe("Include image IDs"),
-  depth: z
-    .number()
-    .min(0)
-    .max(3)
-    .default(1)
-    .describe("Category depth to fetch (0=top level, 1=with subcategories)"),
+const recipeIngredientSchema = z.object({
+  ingredientId: z.string(),
+  sellingUnitId: z.string(),
+  name: z.string(),
+  packageInfo: z.string(),
+  priceCents: z.number().nullable(),
+  quantity: z.number(),
+  isPantryItem: z.boolean(),
+})
+
+const structuredRecipeIngredientsSchema = z.object({
+  recipeId: z.string(),
+  recipeName: z.string(),
+  portions: z.number(),
+  ingredients: z.array(recipeIngredientSchema),
 })
 
 toolRegistry.register({
-  name: "picnic_get_category_details",
-  description: "Get detailed information about a specific category including its items",
-  inputSchema: categoryDetailsInputSchema,
-  handler: async (args) => {
-    await ensureClientInitialized()
-    const client = getPicnicClient()
+  name: "picnic_build_shopping_list",
+  description:
+    "Consolidate structured recipe ingredients into a shopping list. Skips pantry items, " +
+    "deduplicates products per recipe, and totals priceCents times quantity.",
+  inputSchema: z.object({
+    recipes: z.array(structuredRecipeIngredientsSchema).min(1).max(20),
+  }),
+  handler: async (args) => buildShoppingList(args.recipes),
+})
 
-    // Find the category by ID (search recursively)
-    const findCategory = (categories: any[], targetId: string): any => {
-      for (const cat of categories) {
-        if (cat.id === targetId) {
-          return cat
-        }
-        if (cat.items && cat.items.length > 0) {
-          const found = findCategory(cat.items, targetId)
-          if (found) return found
-        }
-      }
-      return null
-    }
-
-    try {
-      // Try to get categories with the requested depth, fall back to lower depths if needed
-      let allCategories: any = null
-      let usedDepth = args.depth
-
-      for (let depth = args.depth ?? 1; depth >= 0; depth--) {
-        try {
-          allCategories = await client.getCategories(depth)
-          usedDepth = depth
-          break
-        } catch (error) {
-          if (depth === 0) {
-            // If even depth=0 fails, re-throw the error
-            throw error
-          }
-          // Continue to try lower depth
-        }
-      }
-
-      const catalogArray = allCategories.catalog || []
-      const categoryDetails = findCategory(catalogArray, args.categoryId)
-
-      if (!categoryDetails) {
-        return {
-          error: `Category with ID '${args.categoryId}' not found`,
-          categoryId: args.categoryId,
-          usedDepth,
-          suggestion: "Use picnic_get_categories to find valid category IDs.",
-        }
-      }
-
-      // Filter and structure the response
-      const filteredCategory: any = {
-        id: categoryDetails.id,
-        name: categoryDetails.name,
-        type: categoryDetails.type,
-        ...(categoryDetails.level && { level: categoryDetails.level }),
-        ...(args.includeImages &&
-          categoryDetails.image_id && { image_id: categoryDetails.image_id }),
-      }
-
-      // Handle items/subcategories
-      if (args.includeItems && categoryDetails.items) {
-        const items = categoryDetails.items.slice(0, args.itemsLimit).map((item: any) => {
-          // Check if it's a subcategory or a product
-          if (item.type === "CATEGORY") {
-            return {
-              id: item.id,
-              name: item.name,
-              type: item.type,
-              items_count: item.items ? item.items.length : 0,
-              ...(args.includeImages && item.image_id && { image_id: item.image_id }),
-            }
-          } else {
-            // It's a product
-            return {
-              id: item.id,
-              name: item.name,
-              type: item.type,
-              price: item.display_price,
-              unit: item.unit_quantity,
-              ...(args.includeImages && item.image_id && { image_id: item.image_id }),
-            }
-          }
-        })
-
-        filteredCategory.items = items
-        filteredCategory.items_count = categoryDetails.items.length
-        filteredCategory.items_returned = items.length
-      }
-
-      return {
-        category: filteredCategory,
-        meta: {
-          categoryId: args.categoryId,
-          includeItems: args.includeItems,
-          itemsLimit: args.itemsLimit,
-          usedDepth,
-          requestedDepth: args.depth,
-          truncated:
-            args.includeItems &&
-            categoryDetails.items &&
-            categoryDetails.items.length > (args.itemsLimit || 20),
-        },
-      }
-    } catch (error) {
-      return {
-        error: `Failed to get category details: ${error instanceof Error ? error.message : String(error)}`,
-        categoryId: args.categoryId,
-        suggestion:
-          "Make sure the category ID is valid. Use picnic_get_categories to find valid IDs.",
-      }
-    }
-  },
+toolRegistry.register({
+  name: "picnic_find_meal_combinations",
+  description:
+    "Rank combinations of structured Picnic recipes by shared non-pantry ingredients, " +
+    "using the same conservative cost calculation as picnic_build_shopping_list.",
+  inputSchema: z.object({
+    recipes: z.array(structuredRecipeIngredientsSchema).min(2).max(50),
+    count: z.number().int().min(2).describe("Number of recipes per combination."),
+    topK: z
+      .number()
+      .int()
+      .min(1)
+      .max(20)
+      .default(5)
+      .describe("Maximum number of combinations to return."),
+    maxTotalBudgetCents: z
+      .number()
+      .int()
+      .min(0)
+      .optional()
+      .describe("Exclude combinations whose conservative shopping-list cost exceeds this."),
+  }),
+  handler: async (args) => findMealCombinations(args),
 })
 
 // Get shopping cart tool
@@ -390,7 +861,7 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const cart = await client.getShoppingCart()
+    const cart = await client.cart.getCart()
     return filterCartData(cart)
   },
 })
@@ -403,12 +874,17 @@ const addToCartInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_add_to_cart",
-  description: "Add a product to the shopping cart",
+  description:
+    "Add a product to the shopping cart. Not idempotent: each call adds another `count` " +
+    "items. If this fails, call picnic_get_cart to check whether the add landed before retrying.",
   inputSchema: addToCartInputSchema,
+  annotations: CART_MUTATION_ANNOTATIONS,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const cart = await client.addProductToShoppingCart(args.productId, args.count)
+    const cart = await mutateCart(`Adding ${args.count} item(s) to cart`, () =>
+      client.cart.addProductToCart(args.productId, args.count),
+    )
     return {
       message: `Added ${args.count} item(s) to cart`,
       cart: filterCartData(cart),
@@ -424,12 +900,18 @@ const removeFromCartInputSchema = z.object({
 
 toolRegistry.register({
   name: "picnic_remove_from_cart",
-  description: "Remove a product from the shopping cart",
+  description:
+    "Remove a product from the shopping cart. Not idempotent: each call removes another " +
+    "`count` items. If this fails, call picnic_get_cart to check whether the removal landed " +
+    "before retrying.",
   inputSchema: removeFromCartInputSchema,
+  annotations: CART_MUTATION_ANNOTATIONS,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const cart = await client.removeProductFromShoppingCart(args.productId, args.count)
+    const cart = await mutateCart(`Removing ${args.count} item(s) from cart`, () =>
+      client.cart.removeProductFromCart(args.productId, args.count),
+    )
     return {
       message: `Removed ${args.count} item(s) from cart`,
       cart: filterCartData(cart),
@@ -442,10 +924,11 @@ toolRegistry.register({
   name: "picnic_clear_cart",
   description: "Clear all items from the shopping cart",
   inputSchema: z.object({}),
+  annotations: CART_MUTATION_ANNOTATIONS,
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const cart = await client.clearShoppingCart()
+    const cart = await mutateCart("Clearing the cart", () => client.cart.clearCart())
     return {
       message: "Shopping cart cleared",
       cart: filterCartData(cart),
@@ -461,7 +944,7 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const slots = await client.getDeliverySlots()
+    const slots = await client.cart.getDeliverySlots()
     return slots
   },
 })
@@ -478,7 +961,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const result = await client.setDeliverySlot(args.slotId)
+    const result = await client.cart.setDeliverySlot(args.slotId)
     return {
       message: "Delivery slot selected",
       slotId: args.slotId,
@@ -510,7 +993,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const allDeliveries = await client.getDeliveries(args.filter as string[])
+    const allDeliveries = await client.delivery.getDeliveries(args.filter as string[])
 
     // Apply pagination
     const startIndex = args.offset || 0
@@ -542,7 +1025,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const delivery = await client.getDelivery(args.deliveryId)
+    const delivery = await client.delivery.getDelivery(args.deliveryId)
     return delivery
   },
 })
@@ -555,7 +1038,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const position = await client.getDeliveryPosition(args.deliveryId)
+    const position = await client.delivery.getDeliveryPosition(args.deliveryId)
     return position
   },
 })
@@ -568,7 +1051,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const scenario = await client.getDeliveryScenario(args.deliveryId)
+    const scenario = await client.delivery.getDeliveryScenario(args.deliveryId)
     return scenario
   },
 })
@@ -581,7 +1064,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const result = await client.cancelDelivery(args.deliveryId)
+    const result = await client.delivery.cancelDelivery(args.deliveryId)
     return {
       message: "Delivery cancelled",
       deliveryId: args.deliveryId,
@@ -603,7 +1086,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const result = await client.setDeliveryRating(args.deliveryId, args.rating)
+    const result = await client.delivery.setDeliveryRating(args.deliveryId, args.rating)
     return {
       message: `Delivery rated ${args.rating}/10`,
       deliveryId: args.deliveryId,
@@ -624,7 +1107,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const result = await client.sendDeliveryInvoiceEmail(args.deliveryId)
+    const result = await client.delivery.sendDeliveryInvoiceEmail(args.deliveryId)
     return {
       message: "Delivery invoice email sent",
       deliveryId: args.deliveryId,
@@ -645,7 +1128,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const orderStatus = await client.getOrderStatus(args.orderId)
+    const orderStatus = await client.cart.getOrderStatus(args.orderId)
     return orderStatus
   },
 })
@@ -658,7 +1141,7 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const user = await client.getUserDetails()
+    const user = await client.user.getUserDetails()
     return user
   },
 })
@@ -671,57 +1154,8 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const userInfo = await client.getUserInfo()
+    const userInfo = await client.user.getUserInfo()
     return userInfo
-  },
-})
-
-// Get lists tool
-const listsInputSchema = z.object({
-  depth: z.number().min(0).max(5).default(0).describe("List depth to retrieve"),
-})
-
-toolRegistry.register({
-  name: "picnic_get_lists",
-  description: "Get shopping lists and sublists",
-  inputSchema: listsInputSchema,
-  handler: async (args) => {
-    await ensureClientInitialized()
-    const client = getPicnicClient()
-    const lists = await client.getLists(args.depth)
-    return lists
-  },
-})
-
-// Get specific list tool
-const getListInputSchema = z.object({
-  listId: z.string().describe("The ID of the list to get"),
-  subListId: z.string().optional().describe("The ID of the sub list to get"),
-  depth: z.number().min(0).max(5).default(0).describe("List depth to retrieve"),
-})
-
-toolRegistry.register({
-  name: "picnic_get_list",
-  description: "Get a specific list or sublist with its items",
-  inputSchema: getListInputSchema,
-  handler: async (args) => {
-    await ensureClientInitialized()
-    const client = getPicnicClient()
-    const list = await client.getList(args.listId, args.subListId || undefined, args.depth)
-    return list
-  },
-})
-
-// Get MGM details tool
-toolRegistry.register({
-  name: "picnic_get_mgm_details",
-  description: "Get MGM (friends discount) details",
-  inputSchema: z.object({}),
-  handler: async () => {
-    await ensureClientInitialized()
-    const client = getPicnicClient()
-    const mgmDetails = await client.getMgmDetails()
-    return mgmDetails
   },
 })
 
@@ -733,7 +1167,7 @@ toolRegistry.register({
   handler: async () => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const paymentProfile = await client.getPaymentProfile()
+    const paymentProfile = await client.payment.getPaymentProfile()
     return paymentProfile
   },
 })
@@ -751,7 +1185,7 @@ toolRegistry.register({
     await ensureClientInitialized()
     const client = getPicnicClient()
     const pageNumber = args.pageNumber ?? 1
-    const transactions = await client.getWalletTransactions(pageNumber)
+    const transactions = await client.payment.getWalletTransactions(pageNumber)
     return {
       pageNumber,
       transactions,
@@ -771,7 +1205,7 @@ toolRegistry.register({
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const details = await client.getWalletTransactionDetails(args.transactionId as string)
+    const details = await client.payment.getWalletTransactionDetails(args.transactionId as string)
     return details
   },
 })
@@ -789,11 +1223,23 @@ toolRegistry.register({
     await ensureClientInitialized()
     const client = getPicnicClient()
     const channel = args.channel || "SMS"
-    const result = await client.generate2FACode(channel)
-    return {
-      message: "2FA code generated and sent",
-      channel,
-      result,
+    try {
+      const result = await client.auth.generate2FACode(channel)
+      return {
+        message: "2FA code generated and sent",
+        channel,
+        result,
+      }
+    } catch (error: unknown) {
+      // The Picnic API returns empty bodies for 2FA endpoints, which causes JSON parse errors
+      // but the actual request succeeds
+      if (error instanceof SyntaxError && (error as Error).message.includes("JSON")) {
+        return {
+          message: "2FA code generated and sent",
+          channel,
+        }
+      }
+      throw error
     }
   },
 })
@@ -808,73 +1254,12 @@ toolRegistry.register({
   inputSchema: verify2FAInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
-    const client = getPicnicClient()
-    const result = await client.verify2FACode(args.code)
+    await verifyPicnic2FACode(args.code)
+    await saveSession()
+
     return {
       message: "2FA code verified",
       code: args.code,
-      result,
     }
   },
 })
-
-// Replace the entire picnic_analyze_response_size tool with this:
-toolRegistry.register({
-  name: "picnic_analyze_response_size",
-  description: "Analyze response size and structure for optimization",
-  inputSchema: z.object({
-    method: z
-      .enum([
-        "search",
-        "getSuggestions",
-        "getArticle",
-        "getCategories",
-        "getShoppingCart",
-        "getDeliverySlots",
-        "getDeliveries",
-        "getUserDetails",
-        "getLists",
-        "getWalletTransactions",
-      ])
-      .describe("API method to analyze"),
-    params: z.record(z.unknown()).optional().describe("Parameters for the API call"),
-  }),
-  handler: async (args) => {
-    await ensureClientInitialized()
-    const client = getPicnicClient()
-
-    let response: any
-
-    try {
-      switch (args.method) {
-        case "search":
-          response = await client.search((args.params?.query as string) || "apple")
-          break
-        case "getCategories":
-          response = await client.getCategories((args.params?.depth as number) || 0)
-          break
-        default:
-          return { error: "Method not implemented yet" }
-      }
-
-      const jsonString = JSON.stringify(response)
-      const sizeKB = Math.round((jsonString.length / 1024) * 100) / 100
-
-      return {
-        method: args.method,
-        sizeKB,
-        structure: Array.isArray(response)
-          ? `Array with ${response.length} items`
-          : typeof response,
-        sample: jsonString.substring(0, 200) + "...",
-      }
-    } catch (error) {
-      return {
-        error: error instanceof Error ? error.message : String(error),
-      }
-    }
-  },
-})
-
-// Note: picnic_debug_search_article diagnostic tool removed - no longer needed
-// since product detail endpoints are confirmed deprecated (GitHub issue #23)

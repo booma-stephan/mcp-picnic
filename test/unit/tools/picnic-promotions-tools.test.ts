@@ -89,6 +89,37 @@ function regularTile() {
   }
 }
 
+function bootstrapWithPromoTab(pageId: string) {
+  return {
+    landing_tab_id: "home",
+    tabs: [
+      {
+        id: "home",
+        tab_type: "PAGE",
+        target: { type: "PICNIC_PAGE_REFERENCE", reference: "home_page_root" },
+        icon_config: { icons: [{ type: "PRESET", preset: "STOREFRONT" }] },
+      },
+      {
+        id: "promo",
+        tab_type: "PAGE",
+        title: "Alle acties",
+        target: { type: "PICNIC_PAGE_REFERENCE", reference: pageId },
+        icon_config: { icons: [{ type: "PRESET", preset: "PROMO" }] },
+      },
+    ],
+  }
+}
+
+function promoPage(children: unknown[]) {
+  return {
+    layout: {
+      body: {
+        children,
+      },
+    },
+  }
+}
+
 async function loadTools() {
   vi.resetModules()
   const { toolRegistry } = await import("../../../src/tools/registry.js")
@@ -101,7 +132,7 @@ describe("promotions tools", () => {
     vi.clearAllMocks()
   })
 
-  it("fetches weekly Picnic promotions from the all-promos page", async () => {
+  it("discovers the current acties page from bootstrap instead of a hardcoded id", async () => {
     const firstTile = promoTile({
       productId: "s100",
       promotionId: "promo-1",
@@ -110,37 +141,42 @@ describe("promotions tools", () => {
       price: 199,
       originalPrice: 249,
     })
-    mocks.sendRequest.mockResolvedValue({
-      layout: {
-        body: {
-          children: [
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") return bootstrapWithPromoTab("promo-page-weekly-deals")
+      if (path === "/pages/promo-page-weekly-deals") {
+        return promoPage([
+          firstTile,
+          regularTile(),
+          [
+            promoTile({
+              productId: "s200",
+              promotionId: "promo-2",
+              name: "Bonus pasta",
+              label: "1+1 gratis",
+              price: 239,
+            }),
             firstTile,
-            regularTile(),
-            [
-              promoTile({
-                productId: "s200",
-                promotionId: "promo-2",
-                name: "Bonus pasta",
-                label: "1+1 gratis",
-                price: 239,
-              }),
-              firstTile,
-            ],
           ],
-        },
-      },
+        ])
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`)
     })
 
     const toolRegistry = await loadTools()
     const result = await toolRegistry.executeTool("picnic_get_promotions", {})
     const payload = parseToolResult(result)
 
+    expect(mocks.sendRequest).toHaveBeenCalledWith("GET", "/bootstrap", null, true)
     expect(mocks.sendRequest).toHaveBeenCalledWith(
       "GET",
-      "/pages/promo-page-all-promos-redirect",
+      "/pages/promo-page-weekly-deals",
       null,
       true,
     )
+    expect(payload.source).toEqual({
+      pageId: "promo-page-weekly-deals",
+      endpoint: "/pages/promo-page-weekly-deals",
+    })
     expect(payload.promotions).toEqual([
       {
         product_id: "s100",
@@ -173,10 +209,26 @@ describe("promotions tools", () => {
     })
   })
 
-  it("paginates promotions after deduplicating repeated tiles", async () => {
-    mocks.sendRequest.mockResolvedValue({
-      layout: {
-        body: [
+  it("follows an all-promos link when the bootstrap tab page has no deal tiles", async () => {
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") return bootstrapWithPromoTab("promo-page-hub")
+      if (path === "/pages/promo-page-hub") {
+        return {
+          body: {
+            children: [
+              {
+                type: "TOUCHABLE",
+                onPress: {
+                  actionType: "OPEN",
+                  target: "nl.picnic-supermarkt://store/page;id=promo-page-all-current-deals",
+                },
+              },
+            ],
+          },
+        }
+      }
+      if (path === "/pages/promo-page-all-current-deals") {
+        return promoPage([
           promoTile({
             productId: "s100",
             promotionId: "promo-1",
@@ -184,6 +236,47 @@ describe("promotions tools", () => {
             label: "nu €1.99",
             price: 199,
           }),
+        ])
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`)
+    })
+
+    const toolRegistry = await loadTools()
+    const result = await toolRegistry.executeTool("picnic_get_promotions", {})
+    const payload = parseToolResult(result)
+
+    expect(payload.source.pageId).toBe("promo-page-all-current-deals")
+    expect(payload.promotions).toEqual([
+      expect.objectContaining({ product_id: "s100", promotion_id: "promo-1" }),
+    ])
+  })
+
+  it("skips a stale leftover all-promos page id when the nested fetch 404s", async () => {
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") return bootstrapWithPromoTab("promo-page-hub")
+      if (path === "/pages/promo-page-hub") {
+        return {
+          body: {
+            children: [
+              {
+                analytics: { leftover: "/pages/promo-page-all-promos-redirect" },
+              },
+              {
+                type: "TOUCHABLE",
+                onPress: {
+                  actionType: "OPEN",
+                  target: "nl.picnic-supermarkt://store/page;id=promo-page-weekly-deals",
+                },
+              },
+            ],
+          },
+        }
+      }
+      if (path === "/pages/promo-page-all-promos-redirect") {
+        throw new Error("page-template not found")
+      }
+      if (path === "/pages/promo-page-weekly-deals") {
+        return promoPage([
           promoTile({
             productId: "s200",
             promotionId: "promo-2",
@@ -191,15 +284,132 @@ describe("promotions tools", () => {
             label: "1+1 gratis",
             price: 239,
           }),
+        ])
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`)
+    })
+
+    const toolRegistry = await loadTools()
+    const result = await toolRegistry.executeTool("picnic_get_promotions", {})
+    const payload = parseToolResult(result)
+
+    expect(payload.source.pageId).toBe("promo-page-weekly-deals")
+    expect(payload.promotions[0].product_id).toBe("s200")
+  })
+
+  it("falls back to a promo page linked from the home page when bootstrap has no acties tab", async () => {
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") {
+        return {
+          tabs: [
+            {
+              id: "home",
+              tab_type: "PAGE",
+              target: { type: "PICNIC_PAGE_REFERENCE", reference: "home_page_root" },
+              icon_config: { icons: [{ type: "PRESET", preset: "STOREFRONT" }] },
+            },
+          ],
+        }
+      }
+      if (path === "/pages/home_page_root") {
+        return {
+          body: {
+            children: [
+              {
+                type: "TOUCHABLE",
+                onPress: {
+                  actionType: "OPEN",
+                  target: "nl.picnic-supermarkt://store/page;id=promo-page-home-acties",
+                },
+              },
+            ],
+          },
+        }
+      }
+      if (path === "/pages/promo-page-home-acties") {
+        return promoPage([
           promoTile({
-            productId: "s300",
-            promotionId: "promo-3",
-            name: "Deal soap",
-            label: "2 voor €5",
-            price: 279,
+            productId: "s400",
+            promotionId: "promo-4",
+            name: "Deal milk",
+            label: "nu €0.99",
+            price: 99,
           }),
-        ],
-      },
+        ])
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`)
+    })
+
+    const toolRegistry = await loadTools()
+    const result = await toolRegistry.executeTool("picnic_get_promotions", {})
+    const payload = parseToolResult(result)
+
+    expect(payload.source.pageId).toBe("promo-page-home-acties")
+    expect(payload.promotions[0].product_id).toBe("s400")
+  })
+
+  it("fails clearly when bootstrap and home do not expose an acties page", async () => {
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") {
+        return {
+          tabs: [
+            {
+              id: "home",
+              tab_type: "PAGE",
+              target: { type: "PICNIC_PAGE_REFERENCE", reference: "home_page_root" },
+            },
+          ],
+        }
+      }
+      if (path === "/pages/home_page_root") return { body: { children: [] } }
+      throw new Error(`Unexpected request: ${method} ${path}`)
+    })
+
+    const toolRegistry = await loadTools()
+    await expect(toolRegistry.executeTool("picnic_get_promotions", {})).rejects.toThrow(
+      /could not discover/i,
+    )
+    expect(mocks.sendRequest).not.toHaveBeenCalledWith(
+      "GET",
+      "/pages/promo-page-all-promos-redirect",
+      null,
+      true,
+    )
+  })
+
+  it("paginates promotions after deduplicating repeated tiles", async () => {
+    mocks.sendRequest.mockImplementation((method: string, path: string) => {
+      if (path === "/bootstrap") return bootstrapWithPromoTab("promo-page-weekly-deals")
+      if (path === "/pages/promo-page-weekly-deals") {
+        return {
+          layout: {
+            body: [
+              promoTile({
+                productId: "s100",
+                promotionId: "promo-1",
+                name: "Discount tomatoes",
+                label: "nu €1.99",
+                price: 199,
+              }),
+              promoTile({
+                productId: "s200",
+                promotionId: "promo-2",
+                name: "Bonus pasta",
+                label: "1+1 gratis",
+                price: 239,
+              }),
+              promoTile({
+                productId: "s300",
+                promotionId: "promo-3",
+                name: "Deal soap",
+                label: "2 voor €5",
+                price: 279,
+              }),
+            ],
+          },
+        }
+      }
+      throw new Error(`Unexpected request: ${method} ${path}`)
     })
 
     const toolRegistry = await loadTools()

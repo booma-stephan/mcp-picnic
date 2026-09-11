@@ -17,6 +17,12 @@ import {
   findMealCombinations,
   parseRecipeIngredients,
 } from "../utils/recipe-meal-planning.js"
+import {
+  extractPromoPageIds,
+  pickBestPromoPageId,
+  rankPromoPageIds,
+  resolvePromotionsPageId,
+} from "../utils/promotions.js"
 import { config } from "../config.js"
 
 /**
@@ -224,6 +230,29 @@ function extractPromotionsFromPage(page: unknown): PicnicPromotionProduct[] {
   return promotions
 }
 
+async function fetchPage(client: ReturnType<typeof getPicnicClient>, pageId: string) {
+  return client.sendRequest("GET", `/pages/${pageId}`, null, true)
+}
+
+async function resolveActiesPageId(client: ReturnType<typeof getPicnicClient>): Promise<string> {
+  const bootstrap = await client.sendRequest("GET", "/bootstrap", null, true)
+  const fromBootstrap = resolvePromotionsPageId(bootstrap)
+  if (fromBootstrap) return fromBootstrap
+
+  try {
+    const home = await fetchPage(client, "home_page_root")
+    const fromHome = pickBestPromoPageId(extractPromoPageIds(home, true))
+    if (fromHome) return fromHome
+  } catch {
+    // Home is only a fallback; the discovery error below is the one callers should see.
+  }
+
+  throw new Error(
+    "Could not discover Picnic's current promotions page from bootstrap or home. " +
+      "The weekly deals page id is resolved at runtime because Picnic changes it.",
+  )
+}
+
 // Search products tool
 const searchInputSchema = z.object({
   query: z.string().describe("Search query for products"),
@@ -296,20 +325,34 @@ const promotionsInputSchema = z.object({
 toolRegistry.register({
   name: "picnic_get_promotions",
   description:
-    "Get Picnic's current weekly promotions/deals from the app's 'Alle acties' page. " +
-    "Returns promoted products with current price, promotion label, original price when shown, " +
-    "and pagination.",
+    "Get Picnic's current weekly promotions/deals. Discovers the current acties/Aktionen " +
+    "page from app bootstrap because Picnic changes that page id. Returns promoted products " +
+    "with current price, promotion label, original price when shown, and pagination.",
   inputSchema: promotionsInputSchema,
   handler: async (args) => {
     await ensureClientInitialized()
     const client = getPicnicClient()
-    const page = await client.sendRequest(
-      "GET",
-      "/pages/promo-page-all-promos-redirect",
-      null,
-      true,
-    )
-    const allPromotions = extractPromotionsFromPage(page)
+    let pageId = await resolveActiesPageId(client)
+    const page = await fetchPage(client, pageId)
+    let allPromotions = extractPromotionsFromPage(page)
+
+    if (allPromotions.length === 0) {
+      const nestedIds = rankPromoPageIds(
+        extractPromoPageIds(page, true).filter((id) => id !== pageId),
+      )
+      for (const nestedId of nestedIds) {
+        try {
+          const nestedPromotions = extractPromotionsFromPage(await fetchPage(client, nestedId))
+          if (nestedPromotions.length > 0) {
+            pageId = nestedId
+            allPromotions = nestedPromotions
+            break
+          }
+        } catch {
+          // Leftover stale page ids (e.g. the old all-promos redirect) must not fail the tool.
+        }
+      }
+    }
 
     const startIndex = args.offset ?? 0
     const limit = args.limit ?? 25
@@ -317,8 +360,8 @@ toolRegistry.register({
 
     return {
       source: {
-        pageId: "promo-page-all-promos-redirect",
-        endpoint: "/pages/promo-page-all-promos-redirect",
+        pageId,
+        endpoint: `/pages/${pageId}`,
       },
       promotions,
       pagination: {
